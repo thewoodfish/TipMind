@@ -8,6 +8,7 @@ from backend.api.routes import router
 from backend.api.websocket import websocket_endpoint, register_event_handlers
 from backend.agents.tip_agent import WatchTimeTipAgent
 from backend.agents.emotion_agent import EmotionChatAgent
+from backend.agents.milestone_agent import MilestoneTipAgent
 
 
 @asynccontextmanager
@@ -17,6 +18,7 @@ async def lifespan(app: FastAPI):
     register_event_handlers()
     WatchTimeTipAgent(db_session_factory=AsyncSessionLocal).subscribe()
     EmotionChatAgent(db_session_factory=AsyncSessionLocal).subscribe()
+    MilestoneTipAgent(db_session_factory=AsyncSessionLocal).subscribe()
     logger.info("TipMind ready")
     yield
     logger.info("TipMind shutting down")
