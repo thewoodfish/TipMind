@@ -2,6 +2,7 @@
 Orchestrator — coordinates the full tip lifecycle:
 analyze → decide → send → record → confirm
 """
+import json
 import uuid
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,9 +10,12 @@ from sqlalchemy import select
 
 from backend.agents.swarm_agent import SwarmAgent
 from backend.core.wallet import wallet_client
-from backend.core.event_bus import event_bus, Events
+from backend.core.event_bus import event_bus, EventType
 from backend.core.swarm_pool import swarm_pool, SwarmTask
-from backend.data.models import TipEvent, CreatorMilestone, AgentLog
+from backend.data.models import (
+    TipTransactionORM,
+    AgentDecisionLogORM,
+)
 
 
 class Orchestrator:
@@ -21,37 +25,36 @@ class Orchestrator:
     async def process_video(self, video_metadata: dict, db: AsyncSession) -> dict:
         """
         Full pipeline for a single video:
-        1. Fetch previously rewarded milestones for the creator
-        2. Run SwarmAgent
-        3. If tip decided, send via WDK
-        4. Persist TipEvent and milestone records
+        1. Run SwarmAgent (emotion + milestone + tip agents)
+        2. If tip decided, send via WDK wallet
+        3. Persist TipTransactionORM and AgentDecisionLogORM records
 
         Args:
-            video_metadata: dict with id, title, creator_address, view_count, like_count, etc.
+            video_metadata: dict with id, title, creator_id, creator_address, view_count, like_count, etc.
             db: Async SQLAlchemy session
 
         Returns:
             Full pipeline result dict
         """
         video_id = video_metadata.get("id", str(uuid.uuid4()))
-        creator_address = video_metadata.get("creator_address", "")
+        creator_id = video_metadata.get("creator_id", video_metadata.get("creator_address", ""))
+        creator_address = video_metadata.get("creator_address", creator_id)
 
-        # Fetch previously rewarded milestones
-        stmt = select(CreatorMilestone.milestone_type).where(
-            CreatorMilestone.creator_address == creator_address,
-            CreatorMilestone.rewarded == True,
+        # Fetch previously rewarded milestone types for this creator
+        stmt = select(AgentDecisionLogORM.trigger).where(
+            AgentDecisionLogORM.creator_id == creator_id,
+            AgentDecisionLogORM.trigger.like("MILESTONE:%"),
         )
         rows = await db.execute(stmt)
-        previously_rewarded = [r[0] for r in rows.fetchall()]
+        previously_rewarded = [r[0].replace("MILESTONE:", "") for r in rows.fetchall()]
 
-        # Create swarm task
+        # Create and run swarm task under concurrency control
         task = SwarmTask(
             task_id=str(uuid.uuid4()),
             video_id=video_id,
             payload=video_metadata,
         )
 
-        # Run swarm under concurrency control
         async def _run():
             return await self.swarm.analyze_and_decide(video_metadata, previously_rewarded)
 
@@ -65,23 +68,23 @@ class Orchestrator:
         milestone_result = swarm_result["milestone_result"]
         emotion_result = swarm_result["emotion_result"]
 
-        # Log agent outputs
-        await self._log_agents(db, video_id, swarm_result)
+        # Log all agent decisions
+        await self._log_agents(db, video_id, creator_id, swarm_result)
 
-        tip_event = TipEvent(
-            video_id=video_id,
-            creator_address=creator_address,
+        tip_tx = TipTransactionORM(
+            from_wallet=video_metadata.get("from_wallet", "tipmind_vault"),
+            to_wallet=creator_address,
             amount=tip_decision.get("amount", 0),
-            reason=tip_decision.get("reason"),
-            emotion_score=emotion_result.get("score"),
-            milestone_triggered=milestone_result.get("milestone_triggered", False),
+            token=tip_decision.get("token", "USDT"),
+            creator_id=creator_id,
+            trigger_type="SWARM",
             status="skipped",
         )
 
         if tip_decision.get("should_tip") and tip_decision.get("amount", 0) > 0:
-            tip_event.status = "pending"
-            db.add(tip_event)
-            await db.flush()  # get the id
+            tip_tx.status = "pending"
+            db.add(tip_tx)
+            await db.flush()
 
             try:
                 tx = await wallet_client.send_tip(
@@ -89,53 +92,53 @@ class Orchestrator:
                     amount=tip_decision["amount"],
                     memo=tip_decision.get("reason", "TipMind tip"),
                 )
-                tip_event.tx_hash = tx.get("tx_hash")
-                tip_event.status = "confirmed"
-                await event_bus.publish(Events.TIP_SENT, {
+                tip_tx.tx_hash = tx.get("tx_hash")
+                tip_tx.status = "confirmed"
+                await event_bus.publish(EventType.TIP_EXECUTED, {
                     "video_id": video_id,
-                    "amount": tip_event.amount,
-                    "tx_hash": tip_event.tx_hash,
+                    "amount": tip_tx.amount,
+                    "tx_hash": tip_tx.tx_hash,
                 })
             except Exception as exc:
-                tip_event.status = "failed"
+                tip_tx.status = "failed"
                 logger.error(f"Wallet send failed for {video_id}: {exc}")
-                await event_bus.publish(Events.TIP_FAILED, {"video_id": video_id, "error": str(exc)})
+                await event_bus.publish(EventType.TIP_EXECUTED, {
+                    "video_id": video_id,
+                    "error": str(exc),
+                    "status": "failed",
+                })
         else:
-            db.add(tip_event)
-
-        # Record new milestones
-        for milestone in milestone_result.get("new_milestones", []):
-            db.add(CreatorMilestone(
-                creator_address=creator_address,
-                milestone_type=milestone["type"],
-                threshold=milestone["threshold"],
-                rewarded=True,
-            ))
+            db.add(tip_tx)
 
         await db.commit()
 
         return {
             "video_id": video_id,
-            "tip_event_id": tip_event.id,
+            "tip_tx_id": tip_tx.id,
             "tip_decision": tip_decision,
             "emotion_result": emotion_result,
             "milestone_result": milestone_result,
-            "tx_hash": tip_event.tx_hash,
-            "status": tip_event.status,
+            "tx_hash": tip_tx.tx_hash,
+            "status": tip_tx.status,
         }
 
-    async def _log_agents(self, db: AsyncSession, video_id: str, swarm_result: dict) -> None:
-        agents = [
-            ("EmotionAgent", swarm_result.get("emotion_result")),
-            ("MilestoneAgent", swarm_result.get("milestone_result")),
-            ("TipAgent", swarm_result.get("tip_decision")),
+    async def _log_agents(
+        self, db: AsyncSession, video_id: str, creator_id: str, swarm_result: dict
+    ) -> None:
+        entries = [
+            ("EmotionAgent",   "EMOTION",    swarm_result.get("emotion_result")),
+            ("MilestoneAgent", "MILESTONE",  swarm_result.get("milestone_result")),
+            ("TipAgent",       "SWARM",      swarm_result.get("tip_decision")),
         ]
-        import json
-        for name, output in agents:
-            db.add(AgentLog(
-                agent_name=name,
-                video_id=video_id,
-                output_summary=json.dumps(output, default=str)[:500] if output else None,
+        for agent_type, trigger, output in entries:
+            decision = swarm_result.get("tip_decision", {})
+            db.add(AgentDecisionLogORM(
+                agent_type=agent_type,
+                trigger=trigger,
+                creator_id=creator_id,
+                amount_usd=decision.get("amount", 0) if agent_type == "TipAgent" else 0,
+                reasoning=json.dumps(output, default=str)[:500] if output else None,
+                confidence_score=decision.get("confidence_score") if agent_type == "TipAgent" else None,
             ))
 
 

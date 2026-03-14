@@ -8,7 +8,7 @@ from loguru import logger
 from backend.agents.emotion_agent import EmotionAgent
 from backend.agents.milestone_agent import MilestoneAgent
 from backend.agents.tip_agent import TipAgent
-from backend.core.event_bus import event_bus, Events
+from backend.core.event_bus import event_bus, EventType
 
 
 class SwarmAgent:
@@ -43,7 +43,7 @@ class SwarmAgent:
         previously_rewarded = previously_rewarded_milestones or []
         video_id = video_metadata.get("id", "unknown")
 
-        await event_bus.publish(Events.SWARM_STARTED, {"video_id": video_id})
+        await event_bus.publish(EventType.SWARM_TRIGGERED, {"video_id": video_id})
         logger.info(f"SwarmAgent starting analysis for video: {video_id}")
 
         # Phase 1: Run emotion and milestone agents in parallel
@@ -58,13 +58,13 @@ class SwarmAgent:
             emotion_task, milestone_task
         )
 
-        await event_bus.publish(Events.EMOTION_SCORED, {
+        await event_bus.publish(EventType.AGENT_DECISION, {
             "video_id": video_id,
             "score": emotion_result.get("score"),
         })
 
         if milestone_result.get("milestone_triggered"):
-            await event_bus.publish(Events.MILESTONE_REACHED, {
+            await event_bus.publish(EventType.MILESTONE_REACHED, {
                 "video_id": video_id,
                 "milestones": milestone_result.get("new_milestones", []),
             })
@@ -74,7 +74,7 @@ class SwarmAgent:
             video_metadata, emotion_result, milestone_result
         )
 
-        await event_bus.publish(Events.TIP_DECIDED, {
+        await event_bus.publish(EventType.AGENT_DECISION, {
             "video_id": video_id,
             "decision": tip_decision,
         })
@@ -86,7 +86,7 @@ class SwarmAgent:
             "milestone_result": milestone_result,
         }
 
-        await event_bus.publish(Events.SWARM_COMPLETED, {
+        await event_bus.publish(EventType.TIP_EXECUTED, {
             "video_id": video_id,
             "should_tip": tip_decision.get("should_tip"),
         })
