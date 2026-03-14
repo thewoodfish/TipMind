@@ -7,6 +7,7 @@ from backend.data.database import create_all_tables, AsyncSessionLocal
 from backend.api.routes import router
 from backend.api.websocket import websocket_endpoint, register_event_handlers
 from backend.agents.tip_agent import WatchTimeTipAgent
+from backend.agents.emotion_agent import EmotionChatAgent
 
 
 @asynccontextmanager
@@ -14,9 +15,8 @@ async def lifespan(app: FastAPI):
     logger.info("Starting TipMind...")
     await create_all_tables()
     register_event_handlers()
-    # Wire watch-time agent to the event bus
-    watch_agent = WatchTimeTipAgent(db_session_factory=AsyncSessionLocal)
-    watch_agent.subscribe()
+    WatchTimeTipAgent(db_session_factory=AsyncSessionLocal).subscribe()
+    EmotionChatAgent(db_session_factory=AsyncSessionLocal).subscribe()
     logger.info("TipMind ready")
     yield
     logger.info("TipMind shutting down")
