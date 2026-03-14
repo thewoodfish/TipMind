@@ -7,7 +7,7 @@ from loguru import logger
 from backend.data.database import get_db
 from backend.data.models import TipEvent, Video, CreatorMilestone
 from backend.core.orchestrator import orchestrator
-from backend.core.wallet import wallet_client
+from backend.core.wallet import wallet
 
 router = APIRouter()
 
@@ -126,7 +126,7 @@ async def get_tip(tip_id: int, db: AsyncSession = Depends(get_db)):
 async def get_wallet_balance():
     """Get the current TipMind wallet balance."""
     try:
-        balance = await wallet_client.get_balance()
+        balance = await wallet.get_balance()
         return balance
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Wallet unavailable: {exc}")

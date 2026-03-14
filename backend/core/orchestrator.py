@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from backend.agents.swarm_agent import SwarmAgent
-from backend.core.wallet import wallet_client
+from backend.core.wallet import wallet
 from backend.core.event_bus import event_bus, EventType
 from backend.core.swarm_pool import swarm_pool, SwarmTask
 from backend.data.models import (
@@ -87,18 +87,13 @@ class Orchestrator:
             await db.flush()
 
             try:
-                tx = await wallet_client.send_tip(
-                    recipient_address=creator_address,
+                tx = await wallet.send_tip(
+                    to_address=creator_address,
                     amount=tip_decision["amount"],
-                    memo=tip_decision.get("reason", "TipMind tip"),
+                    token=tip_decision.get("token", "USDT"),
                 )
-                tip_tx.tx_hash = tx.get("tx_hash")
-                tip_tx.status = "confirmed"
-                await event_bus.publish(EventType.TIP_EXECUTED, {
-                    "video_id": video_id,
-                    "amount": tip_tx.amount,
-                    "tx_hash": tip_tx.tx_hash,
-                })
+                tip_tx.tx_hash = tx.tx_hash
+                tip_tx.status = tx.status
             except Exception as exc:
                 tip_tx.status = "failed"
                 logger.error(f"Wallet send failed for {video_id}: {exc}")
