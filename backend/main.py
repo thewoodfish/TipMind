@@ -1,11 +1,13 @@
 from contextlib import asynccontextmanager
+
+import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from backend.data.database import create_all_tables
 from backend.api.routes import router
-from backend.api.websocket import websocket_endpoint, register_event_handlers
+from backend.api.websocket import websocket_endpoint, ws_feed_endpoint, register_event_handlers
 from backend.core.orchestrator import orchestrator
 
 
@@ -15,7 +17,7 @@ async def lifespan(app: FastAPI):
     await create_all_tables()
     register_event_handlers()
     orchestrator.start()
-    logger.info("TipMind ready")
+    logger.info("TipMind ready — listening on http://0.0.0.0:8000")
     yield
     logger.info("TipMind shutting down")
 
@@ -35,10 +37,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(router, prefix="/api/v1")
-app.add_api_websocket_route("/ws", websocket_endpoint)
+app.include_router(router, prefix="/api")
+app.add_api_websocket_route("/ws/feed", ws_feed_endpoint)
+app.add_api_websocket_route("/ws", websocket_endpoint)           # legacy
 
 
 @app.get("/")
 async def root():
-    return {"name": "TipMind", "version": "0.1.0", "status": "running"}
+    return {
+        "name":    "TipMind",
+        "version": "0.1.0",
+        "status":  "running",
+        "docs":    "/docs",
+        "ws_feed": "ws://localhost:8000/ws/feed",
+    }
+
+
+if __name__ == "__main__":
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)
