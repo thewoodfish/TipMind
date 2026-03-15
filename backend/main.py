@@ -5,10 +5,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
+from backend.config import config
 from backend.data.database import create_all_tables
 from backend.api.routes import router
 from backend.api.websocket import websocket_endpoint, ws_feed_endpoint, register_event_handlers
 from backend.core.orchestrator import orchestrator
+from backend.core.poller import poller
 from backend.demo.seed import run_seed
 
 
@@ -19,14 +21,26 @@ async def lifespan(app: FastAPI):
     await run_seed()
     register_event_handlers()
     orchestrator.start()
+
+    # Start autonomous YouTube poller
+    channel_ids = [
+        cid.strip()
+        for cid in config.youtube_channel_ids.split(",")
+        if cid.strip()
+    ]
+    poller.configure(channel_ids)
+    poller.start()
+
     logger.info("TipMind ready — listening on http://0.0.0.0:8000")
     yield
+
+    poller.stop()
     logger.info("TipMind shutting down")
 
 
 app = FastAPI(
     title="TipMind",
-    description="AI-powered crypto tipping for video creators",
+    description="AI-powered autonomous crypto tipping for video creators",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -52,6 +66,7 @@ async def root():
         "status":  "running",
         "docs":    "/docs",
         "ws_feed": "ws://localhost:8000/ws/feed",
+        "poller":  poller.status(),
     }
 
 

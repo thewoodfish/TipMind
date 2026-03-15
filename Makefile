@@ -1,7 +1,8 @@
-.PHONY: install dev backend frontend demo seed test clean lint
+.PHONY: install dev backend frontend wdk demo seed test clean lint
 
 PYTHON := python3
 NPM    := npm
+NODE   := node
 
 # ─────────────────────────────────────────────
 # Install all dependencies
@@ -9,13 +10,18 @@ NPM    := npm
 install:
 	pip install -r requirements.txt
 	cd frontend && $(NPM) install
+	cd wdk-service && $(NPM) install
 
 # ─────────────────────────────────────────────
-# Run FastAPI + Next.js concurrently (Ctrl-C stops both)
+# Run all 3 services concurrently (Ctrl-C stops all)
+#   :8000 — FastAPI backend
+#   :3000 — Next.js frontend
+#   :3001 — WDK Node.js microservice
 # ─────────────────────────────────────────────
 dev:
-	@echo "▶  Starting TipMind (FastAPI :8000 + Next.js :3000)..."
+	@echo "▶  Starting TipMind (FastAPI :8000 + Next.js :3000 + WDK :3001)..."
 	@trap 'kill 0' SIGINT; \
+		cd wdk-service && $(NODE) index.js & \
 		$(PYTHON) -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload & \
 		cd frontend && $(NPM) run dev & \
 		wait
@@ -26,6 +32,9 @@ backend:
 frontend:
 	cd frontend && $(NPM) run dev
 
+wdk:
+	cd wdk-service && $(NODE) index.js
+
 # ─────────────────────────────────────────────
 # Seed demo data into the database
 # ─────────────────────────────────────────────
@@ -33,16 +42,17 @@ seed:
 	$(PYTHON) -m backend.demo.seed
 
 # ─────────────────────────────────────────────
-# Full demo: seed + launch both servers + open browser
+# Full demo: seed + start all 3 services + open browser
 # ─────────────────────────────────────────────
 demo:
 	@echo "▶  Seeding demo data..."
 	$(PYTHON) -m backend.demo.seed
-	@echo "▶  Launching TipMind demo (FastAPI :8000 + Next.js :3000)..."
+	@echo "▶  Launching TipMind (FastAPI :8000 + Next.js :3000 + WDK :3001)..."
 	@trap 'kill 0' SIGINT; \
+		cd wdk-service && $(NODE) index.js & \
 		$(PYTHON) -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 & \
 		cd frontend && $(NPM) run dev & \
-		sleep 4 && open http://localhost:3000 & \
+		sleep 5 && open http://localhost:3000 & \
 		wait
 
 # ─────────────────────────────────────────────
