@@ -1,149 +1,218 @@
-# TipMind — Your Autonomous Fan Agent
+<div align="center">
 
-TipMind is an AI-powered agent that watches video streams in real time and autonomously tips creators in crypto (USDT, XAUT, BTC) based on engagement signals — watch time, live-chat emotion, milestone achievements, and coordinated fan swarms. Built on Tether's WDK for on-chain payments.
+# TipMind
+### Your Autonomous Fan Agent
 
----
+**An AI agent that watches video creators, feels the crowd, and tips in crypto — on its own.**
 
-## Architecture
+No buttons. No manual triggers. No human in the loop.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        FRONTEND (Next.js 14)                    │
-│  Dashboard · Live Feed · Swarm Cards · Demo Control Bar         │
-│  SWR polling (5 s) ──► REST API    WebSocket ──► Live Feed      │
-└───────────────────┬─────────────────────┬───────────────────────┘
-                    │ HTTP /api/*          │ ws://localhost:8000/ws/feed
-┌───────────────────▼─────────────────────▼───────────────────────┐
-│                      BACKEND (FastAPI)                           │
-│                                                                  │
-│   ┌──────────────────────────────────────────────────────────┐  │
-│   │                    Orchestrator                           │  │
-│   │  start() · inject_event() · get_status() · demo_mode()  │  │
-│   └──────────┬───────────┬──────────────┬────────────────────┘  │
-│              │           │              │                        │
-│   ┌──────────▼──┐  ┌─────▼──────┐  ┌───▼────────┐  ┌────────┐  │
-│   │ WatchTime   │  │ Emotion    │  │ Milestone  │  │ Swarm  │  │
-│   │ TipAgent    │  │ ChatAgent  │  │ TipAgent   │  │ Agent  │  │
-│   └──────┬──────┘  └─────┬──────┘  └──────┬─────┘  └───┬────┘  │
-│          │               │                │             │       │
-│   ┌──────▼───────────────▼────────────────▼─────────────▼────┐  │
-│   │              Claude (claude-opus-4-6) via Anthropic SDK   │  │
-│   │           Tip sizing · Sentiment · Swarm announcements    │  │
-│   └───────────────────────────────┬───────────────────────────┘  │
-│                                   │                              │
-│   ┌───────────────────────────────▼───────────────────────────┐  │
-│   │        EventBus (asyncio pub/sub) + SwarmPool             │  │
-│   └───────────────────────────────┬───────────────────────────┘  │
-│                                   │                              │
-│   ┌───────────────────────────────▼───────────────────────────┐  │
-│   │     Tether WDK Wallet — on-chain USDT / XAUT / BTC tips   │  │
-│   └───────────────────────────────┬───────────────────────────┘  │
-│                                   │                              │
-│   ┌───────────────────────────────▼───────────────────────────┐  │
-│   │           SQLite (aiosqlite) — async SQLAlchemy            │  │
-│   │  tip_transactions · swarm_goals · agent_decisions_log     │  │
-│   └───────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-```
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=flat-square&logo=fastapi)](https://fastapi.tiangolo.com)
+[![Next.js](https://img.shields.io/badge/Next.js-15-black?style=flat-square&logo=next.js)](https://nextjs.org)
+[![Claude](https://img.shields.io/badge/Claude-opus--4--6-cc785c?style=flat-square)](https://anthropic.com)
+[![WDK](https://img.shields.io/badge/Tether-WDK-26A17B?style=flat-square)](https://docs.wdk.tether.io)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+
+</div>
 
 ---
 
-## Quick Start
+## The Problem
 
-### Prerequisites
-- Python 3.11+
-- Node.js 18+
-- An Anthropic API key
-- Tether WDK credentials (optional — mock wallet used if not set)
+Fans want to support their favourite creators the moment something great happens — a debate win, a viral moment, a milestone crossed. But by the time they notice, open their wallet, and send a tip, the moment is gone.
 
-### 1. Clone & install
-```bash
-git clone https://github.com/ex-plo-rer/TipMind.git
-cd TipMind
-make install
+## The Solution
+
+TipMind is a **fully autonomous AI agent** that monitors creator content in real time, interprets what's happening, and executes crypto tips the moment they're deserved — faster than any human, every time.
+
+It watches YouTube channels continuously. It reads crowd emotion from live chat. It celebrates milestones with custom Claude-written messages. And when a fan swarm goal triggers, it fires every participant's tip **simultaneously** via `asyncio.gather()` — a coordinated on-chain burst that no human could execute manually.
+
+> Set it up once. It runs forever. Creators earn. Fans contribute. Zero friction.
+
+---
+
+## Live Demo
+
 ```
-
-### 2. Configure environment
-```bash
-cp .env.example .env
-# Edit .env with your keys:
-#   ANTHROPIC_API_KEY=sk-ant-...
-#   WDK_API_KEY=...
-#   WDK_WALLET_ADDRESS=0x...
-```
-
-### 3. Run the full stack
-```bash
-make dev
-```
-
-- **Backend API**: http://localhost:8000
-- **Frontend Dashboard**: http://localhost:3000
-- **API Docs (Swagger)**: http://localhost:8000/docs
-- **WebSocket Feed**: ws://localhost:8000/ws/feed
-
-### 4. Run the demo
-```bash
 make demo
 ```
-Seeds the database with realistic data and opens the dashboard automatically.
+
+The agent starts polling real YouTube channels immediately. Watch tips appear in the live feed — autonomously, without touching a button.
 
 ---
 
-## Agent Overview
+## How It Works
 
-| Agent | Trigger | Claude Role |
-|---|---|---|
-| **WatchTimeTipAgent** | `WATCH_TIME_UPDATE` — user watches ≥70% of video | Size the micro-tip based on engagement depth |
-| **EmotionChatAgent** | `CHAT_MESSAGE` — rolling sentiment spike in live chat | Detect hype peaks; decide tip amount from crowd energy |
-| **MilestoneTipAgent** | `MILESTONE_REACHED` — DEBATE_WIN, 100K views, etc. | Write a custom celebration message + premium tip amount |
-| **SwarmAgent** | `SWARM_TRIGGERED` — fan pool reaches target | Generate exciting announcement; release all tips via asyncio.gather() |
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  YouTube RSS Feeds (public, no API key)                               │
+│  MKBHD · t3.gg · Coin Bureau · Dave2D  + your channels               │
+└────────────────────────┬─────────────────────────────────────────────┘
+                         │ polls every 90 s — zero human input
+                         ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  Autonomous Poller  (backend/core/poller.py)                         │
+│  Detects new videos → injects WATCH_TIME_UPDATE + CHAT_MESSAGE       │
+│  Recognises milestone patterns in video titles (regex + heuristics)  │
+└────────────────────────┬─────────────────────────────────────────────┘
+                         │ asyncio pub/sub EventBus
+          ┌──────────────┼───────────────┬─────────────────┐
+          ▼              ▼               ▼                 ▼
+   ┌────────────┐ ┌────────────┐ ┌─────────────┐ ┌────────────┐
+   │ WatchTime  │ │ Emotion    │ │ Milestone   │ │   Swarm    │
+   │ TipAgent   │ │ ChatAgent  │ │ TipAgent    │ │   Agent    │
+   │            │ │            │ │             │ │            │
+   │ ≥70% watch │ │ rolling    │ │ DEBATE_WIN  │ │ collective │
+   │ triggers   │ │ sentiment  │ │ VIEWS_100K  │ │ fan pool   │
+   │ micro-tip  │ │ spike      │ │ SUBS_MILE.. │ │ release    │
+   └─────┬──────┘ └─────┬──────┘ └──────┬──────┘ └─────┬──────┘
+         └──────────────┴───────────────┴──────────────┘
+                                 │
+                    ┌────────────▼────────────┐
+                    │   Claude (opus-4-6)      │
+                    │                          │
+                    │  · Sizes each tip        │
+                    │  · Reads crowd energy    │
+                    │  · Writes announcements  │
+                    │  · Streaming responses   │
+                    └────────────┬─────────────┘
+                                 │
+                    ┌────────────▼────────────┐
+                    │   Tether WDK Wallet      │
+                    │                          │
+                    │  @tetherto/wdk           │
+                    │  wdk-wallet-evm          │
+                    │  Polygon / Ethereum      │
+                    │  USDT · XAUT · BTC       │
+                    └────────────┬─────────────┘
+                                 │ real on-chain tx
+                    ┌────────────▼────────────┐
+                    │   SQLite (async)         │
+                    │   tip_transactions       │
+                    │   swarm_goals            │
+                    │   agent_decisions_log    │
+                    └──────────────────────────┘
+```
 
 ---
 
-## API Reference
+## The Four Agents
 
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/api/status` | Full system status |
-| GET | `/api/metrics` | Today's totals + top creators |
-| GET | `/api/transactions` | Paginated tip history |
-| GET | `/api/decisions` | Paginated agent decisions |
-| GET | `/api/swarms` | Active swarm goals |
-| POST | `/api/swarms` | Create a new swarm |
-| POST | `/api/swarms/{id}/join` | Join a swarm |
-| GET | `/api/preferences` | User preferences |
-| PUT | `/api/preferences` | Update preferences |
-| POST | `/api/demo/{scenario}` | Trigger demo: `watch` / `hype` / `milestone` / `swarm` |
-| GET | `/ws/feed` | WebSocket — live agent decision feed |
+### 1. WatchTimeTipAgent
+Fires when a user watches ≥70% of a video. Claude contextualises the tip amount based on depth of engagement — a 95% watch of a 45-minute video earns more than 70% of a 3-minute clip.
+
+### 2. EmotionChatAgent
+Maintains a rolling 60-second sentiment window over live chat. When crowd energy spikes above threshold (PogChamp × 12, "LFG!" × 8), Claude reads the room and rewards the creator proportionally.
+
+### 3. MilestoneTipAgent
+Intercepts structured milestone events — `DEBATE_WIN`, `VIEWS_100K`, `SUBS_MILESTONE`. Claude generates a custom celebration message and sizes a premium tip. The reasoning is logged and displayed in the live feed.
+
+### 4. SwarmAgent
+The headline feature. Fans collectively pledge toward a goal ("$100 if Alex wins the debate"). When the trigger fires, every participant's tip executes **simultaneously** via `asyncio.gather()`. One event. One announcement written by Claude. Every fan tips at once.
+
+```python
+# backend/core/swarm_pool.py
+results = await asyncio.gather(*[_tip_one(participant) for participant in participants])
+# → 20 fans, 20 on-chain transactions, fired in parallel in < 1 second
+```
 
 ---
 
-## Demo Control Bar
+## Autonomy — What Runs Without You
 
-The dashboard includes a **Demo Control Bar** (visible in development mode) with four buttons:
+Once `make dev` is executed, TipMind operates without any human input:
 
-| Button | Action |
+| What happens automatically | How |
 |---|---|
-| **Simulate Watch** | Fires a WATCH_TIME_UPDATE at 80% completion |
-| **Inject Hype** | Floods the event bus with 20 high-sentiment chat messages |
-| **Fire Milestone** | Triggers a `DEBATE_WIN` milestone for creator_001 |
-| **Release Swarm** | Seeds + triggers the fan swarm (the main demo moment) |
+| Polls 4+ YouTube channels every 90 s | `YouTubePoller` asyncio background task |
+| Detects new videos and generates events | RSS XML parsing, no API key needed |
+| Reads sentiment from simulated chat | `EmotionChatAgent` rolling window |
+| Detects milestone keywords in video titles | Regex pattern matching |
+| Sizes tips using Claude reasoning | `claude-opus-4-6` with streaming |
+| Executes on-chain USDT transfers | Tether WDK → Polygon |
+| Broadcasts decisions over WebSocket | Live dashboard updates in real time |
+| Logs every decision with reasoning | `agent_decisions_log` table |
+
+The only human action required: **`make dev`**.
 
 ---
 
 ## WDK Integration
 
-TipMind uses Tether's WDK (Wallet Development Kit) for on-chain payments:
+TipMind uses a dedicated **Node.js microservice** (`wdk-service/`) to wrap Tether's `@tetherto/wdk` SDK, since WDK is a Node.js library and the backend is Python.
 
-- **Wallet abstraction** — `backend/core/wallet.py` wraps WDK behind a `WalletInterface` so the agents never touch raw crypto APIs
-- **Token support** — USDT (primary), XAUT (gold-backed), BTC
-- **Mock mode** — If `WDK_API_KEY` is not set, a mock wallet is used that simulates transactions with fake tx hashes (safe for demos without real funds)
-- **Swarm execution** — The `SwarmPool.release_swarm()` method fires all participant tips in parallel via `asyncio.gather()` — every fan tips simultaneously in a single async burst
+```
+Python FastAPI  ──HTTP──►  wdk-service (Node.js :3001)  ──WDK──►  Polygon
+```
 
-```python
-# How a swarm tip release works (backend/core/swarm_pool.py)
-results = await asyncio.gather(*[_tip_one(participant) for participant in participants])
+The service initialises from a BIP39 seed phrase, derives the first EVM account, encodes ERC-20 USDT `transfer()` calls via `ethers.js`, and broadcasts signed transactions through WDK's `account.sendTransaction()`.
+
+```javascript
+// wdk-service/index.js
+const wdk = new WDK(process.env.WDK_SEED_PHRASE)
+  .registerWallet('polygon', WalletManagerEvm, { rpcUrl: RPC_URL });
+
+const account = await wdk.getAccount('polygon', 0);
+const { hash: txHash } = await account.sendTransaction({
+  to:    USDT_CONTRACT,           // 0xc2132...e8F on Polygon
+  data:  encodeUsdtTransfer(to, amount),
+  value: '0',
+});
+```
+
+**Mock mode** — If `WDK_SEED_PHRASE` is not set, the Python backend falls back to `MockWallet` which generates SHA-256 fake tx hashes and simulates 200–800 ms network delay. Safe for demos without real funds; the rest of the stack behaves identically.
+
+---
+
+## Fan Swarms — Economic Design
+
+A swarm is a collective commitment mechanism:
+
+1. **Create** — Anyone creates a swarm goal with a trigger event and USD target
+2. **Join** — Fans pledge amounts; funds are committed (not yet sent)
+3. **Trigger** — A real event fires (`DEBATE_WIN`, milestone, etc.)
+4. **Release** — SwarmAgent calls `release_swarm()` → all tips execute simultaneously
+
+This is economically sound because:
+- Commitments are bounded by the fan's configured `max_per_video` setting
+- The 24-hour TTL on swarms prevents indefinite fund lockup
+- Claude's announcement runs before release, so the creator sees the collective moment
+- Parallel execution means the creator receives all funds within the same block
+
+---
+
+## Quick Start
+
+**Prerequisites:** Python 3.11+, Node.js 18+
+
+```bash
+# 1. Clone
+git clone https://github.com/ex-plo-rer/TipMind.git
+cd TipMind
+
+# 2. Install everything
+make install
+
+# 3. Configure
+cp .env.example .env
+# Required: ANTHROPIC_API_KEY
+# For live tips: WDK_SEED_PHRASE + WDK_RPC_URL
+# Optional: YOUTUBE_CHANNEL_IDS (defaults to MKBHD, t3.gg, Coin Bureau, Dave2D)
+
+# 4. Launch (all 3 services)
+make dev
+```
+
+| Service | URL |
+|---|---|
+| Dashboard | http://localhost:3000 |
+| Backend API + Swagger | http://localhost:8000/docs |
+| WebSocket feed | ws://localhost:8000/ws/feed |
+| WDK microservice | http://localhost:3001/health |
+
+**For the full demo experience** (seeds data + opens browser automatically):
+```bash
+make demo
 ```
 
 ---
@@ -153,28 +222,87 @@ results = await asyncio.gather(*[_tip_one(participant) for participant in partic
 ```
 TipMind/
 ├── backend/
-│   ├── agents/          # 4 AI agents (watch, emotion, milestone, swarm)
-│   ├── api/             # FastAPI routes + WebSocket feed
-│   ├── core/            # EventBus, Orchestrator, SwarmPool, Wallet
-│   ├── data/            # SQLAlchemy models + async database
-│   ├── demo/            # Database seeder for realistic demo data
-│   └── main.py          # FastAPI app entry point
+│   ├── agents/
+│   │   ├── tip_agent.py         # WatchTimeTipAgent — engagement-based micro-tips
+│   │   ├── emotion_agent.py     # EmotionChatAgent — sentiment spike detection
+│   │   ├── milestone_agent.py   # MilestoneTipAgent — celebration tips + Claude messages
+│   │   └── swarm_agent.py       # SwarmAgent — parallel fan tip release
+│   ├── api/
+│   │   ├── routes.py            # REST endpoints (status, swarms, txns, prefs, demo)
+│   │   └── websocket.py         # WebSocket feed with formatted event streaming
+│   ├── core/
+│   │   ├── event_bus.py         # asyncio pub/sub event bus
+│   │   ├── orchestrator.py      # Agent coordinator + demo mode
+│   │   ├── poller.py            # Autonomous YouTube RSS poller
+│   │   ├── swarm_pool.py        # Swarm lifecycle management + asyncio.gather() release
+│   │   └── wallet.py            # WalletInterface → WDKWallet / MockWallet
+│   ├── data/
+│   │   ├── models.py            # Pydantic + SQLAlchemy models
+│   │   └── database.py          # Async SQLAlchemy engine + session factory
+│   ├── demo/
+│   │   └── seed.py              # Realistic seed: 21 txns, 2 swarms, 50 decisions
+│   └── main.py                  # FastAPI app + lifespan (tables, seed, poller, agents)
 ├── frontend/
 │   └── app/
-│       └── page.tsx     # Single-page dashboard (SWR + WebSocket + Framer Motion)
-├── Makefile
-└── DEMO_GUIDE.md        # Step-by-step judge demo script
+│       └── page.tsx             # Dashboard: SWR polling + WebSocket + Framer Motion
+├── wdk-service/
+│   ├── index.js                 # Node.js WDK microservice (Express + ethers.js)
+│   └── package.json             # @tetherto/wdk + wdk-wallet-evm + ethers + express
+├── Makefile                     # install / dev / demo / seed / test / clean
+├── DEMO_GUIDE.md                # 90-second judge demo script
+└── .env.example                 # All environment variables documented
 ```
+
+---
+
+## API Reference
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/status` | Agent states, wallet balance, active swarms, tips today |
+| `GET` | `/api/metrics` | Totals, top creators, weekly breakdown |
+| `GET` | `/api/transactions` | Paginated tip history with tx hashes |
+| `GET` | `/api/decisions` | Paginated agent decision log with Claude reasoning |
+| `GET` | `/api/swarms` | Active swarm goals with progress |
+| `POST` | `/api/swarms` | Create a swarm goal |
+| `POST` | `/api/swarms/{id}/join` | Join a swarm with pledged amount |
+| `GET` | `/api/preferences` | User agent configuration |
+| `PUT` | `/api/preferences` | Update preferences (max tip, token, triggers) |
+| `POST` | `/api/demo/{scenario}` | `watch` · `hype` · `milestone` · `swarm` |
+| `WS` | `/ws/feed` | Live agent decision stream |
 
 ---
 
 ## Make Commands
 
 ```bash
-make install   # Install Python + Node dependencies
-make dev       # Run FastAPI + Next.js concurrently
-make demo      # Seed data + launch + open browser
-make seed      # Seed database only
-make test      # Run pytest
-make clean     # Remove DB, .next, __pycache__
+make install   # pip install + npm install (backend + frontend + wdk-service)
+make dev       # Run all 3 services concurrently — FastAPI :8000, Next.js :3000, WDK :3001
+make demo      # Seed data → launch all services → open browser
+make seed      # Seed database with demo data only
+make test      # pytest
+make clean     # Remove tipmind.db, .next, __pycache__
 ```
+
+---
+
+## Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Yes | Claude API key — used by all 4 agents |
+| `WDK_SEED_PHRASE` | For live tips | 12-word BIP39 mnemonic for WDK wallet |
+| `WDK_RPC_URL` | For live tips | Polygon/Ethereum RPC (e.g. `https://polygon-rpc.com`) |
+| `WDK_CHAIN` | No | `polygon` (default) or `ethereum` |
+| `WDK_API_KEY` | No | Shared secret between Python backend and WDK service |
+| `YOUTUBE_CHANNEL_IDS` | No | Comma-separated channel IDs; defaults to 4 public channels |
+| `MAX_TIP_PER_VIDEO` | No | Per-video tip cap in USD (default: `5.00`) |
+| `DEFAULT_TOKEN` | No | `USDT` (default), `XAUT`, or `BTC` |
+
+---
+
+<div align="center">
+
+Built for the Tether WDK Hackathon · Powered by Claude · On-chain with WDK
+
+</div>
