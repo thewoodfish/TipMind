@@ -9,12 +9,14 @@ from backend.data.database import create_all_tables
 from backend.api.routes import router
 from backend.api.websocket import websocket_endpoint, ws_feed_endpoint, register_event_handlers
 from backend.core.orchestrator import orchestrator
+from backend.demo.seed import run_seed
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting TipMind...")
     await create_all_tables()
+    await run_seed()
     register_event_handlers()
     orchestrator.start()
     logger.info("TipMind ready — listening on http://0.0.0.0:8000")
