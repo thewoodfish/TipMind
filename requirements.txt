@@ -10,4 +10,5 @@ websockets
 apscheduler
 loguru
 httpx
+openai
 asyncio
