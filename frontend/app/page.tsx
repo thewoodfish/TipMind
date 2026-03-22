@@ -41,7 +41,11 @@ const FEED_ICONS: Record<string, string> = {
   AGENT_DECISION: "🤖", TIP_EXECUTED: "💸",
 };
 
-const fetcher = (url: string) => fetch(url).then(r => r.json());
+const fetcher = async (url: string) => {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`API error ${r.status}`);
+  return r.json();
+};
 
 function truncate(s: string, n = 6) {
   if (!s || s.length <= n * 2 + 3) return s;
@@ -134,11 +138,14 @@ export default function Dashboard() {
   const [triggers,   setTriggers]   = useState({ watch: true, chat: true, milestones: true, swarms: true });
   const [feedEvents, setFeedEvents] = useState<FeedEvent[]>([]);
   const [exploding,  setExploding]  = useState<Set<string>>(new Set());
+  const [wsStatus,   setWsStatus]   = useState<"connecting"|"live"|"reconnecting">("connecting");
+  const wsRef = useRef<WebSocket | null>(null);
+  const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const { data: status }    = useSWR("/api/status",       fetcher, { refreshInterval: 5000 });
-  const { data: metrics }   = useSWR("/api/metrics",      fetcher, { refreshInterval: 5000 });
-  const { data: swarmData } = useSWR("/api/swarms",       fetcher, { refreshInterval: 5000 });
-  const { data: txData }    = useSWR("/api/transactions", fetcher, { refreshInterval: 5000 });
+  const { data: status,    error: statusErr }  = useSWR("/api/status",       fetcher, { refreshInterval: 5000 });
+  const { data: metrics }                      = useSWR("/api/metrics",      fetcher, { refreshInterval: 5000 });
+  const { data: swarmData }                    = useSWR("/api/swarms",       fetcher, { refreshInterval: 5000 });
+  const { data: txData }                       = useSWR("/api/transactions", fetcher, { refreshInterval: 5000 });
 
   const wallet: WalletInfo     = status?.wallet || { balance: 0, address: "", token: "USDT" };
   const m: Metrics             = metrics || { today: { total_usd: 0, tip_count: 0 }, this_week: { total_usd: 0, tip_count: 0 }, top_creators: [], active_swarms_count: 0 };
@@ -147,26 +154,57 @@ export default function Dashboard() {
   const largestTip             = txs.reduce((mx, t) => Math.max(mx, t.amount || 0), 0);
   const uniqueCreators         = new Set(txs.map(t => t.creator_id)).size;
 
-  // WebSocket
+  // WebSocket with auto-reconnect
   useEffect(() => {
-    const ws = new WebSocket("ws://localhost:8000/ws/feed");
-    ws.onmessage = (e) => {
-      try {
-        const ev = JSON.parse(e.data) as FeedEvent;
-        if (!ev.type || ev.type === "PONG") return;
-        const id = `${ev.type}-${Date.now()}-${Math.random()}`;
-        setFeedEvents(prev => [{ ...ev, id }, ...prev].slice(0, 50));
-        // Swarm explosion
-        if (ev.type === "AGENT_DECISION" && ev.metadata?.event === "SWARM_RELEASED") {
-          const sid = ev.metadata.swarm_id as string;
-          if (sid) {
-            setExploding(s => new Set([...s, sid]));
-            setTimeout(() => setExploding(s => { const n = new Set(s); n.delete(sid); return n; }), 1500);
+    let attempt = 0;
+
+    function connect() {
+      setWsStatus(attempt === 0 ? "connecting" : "reconnecting");
+      const wsUrl = (process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000") + "/ws/feed";
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => { attempt = 0; setWsStatus("live"); };
+
+      ws.onmessage = (e) => {
+        try {
+          const ev = JSON.parse(e.data) as FeedEvent;
+          if (!ev.type || ev.type === "PONG") return;
+          const id = `${ev.type}-${Date.now()}-${Math.random()}`;
+          setFeedEvents(prev => [{ ...ev, id }, ...prev].slice(0, 50));
+          if (ev.type === "AGENT_DECISION" && ev.metadata?.event === "SWARM_RELEASED") {
+            const sid = ev.metadata.swarm_id as string;
+            if (sid) {
+              setExploding(s => new Set([...s, sid]));
+              setTimeout(() => setExploding(s => { const n = new Set(s); n.delete(sid); return n; }), 1500);
+            }
           }
-        }
-      } catch { /* noop */ }
+        } catch { /* noop */ }
+      };
+
+      ws.onclose = () => {
+        attempt++;
+        const delay = Math.min(1000 * 2 ** attempt, 30000);
+        setWsStatus("reconnecting");
+        retryRef.current = setTimeout(connect, delay);
+      };
+
+      ws.onerror = () => ws.close(); // triggers onclose → retry
+    }
+
+    connect();
+    return () => {
+      if (retryRef.current) clearTimeout(retryRef.current);
+      wsRef.current?.close();
     };
-    return () => ws.close();
+  }, []);
+
+  const pushPreferences = useCallback(async (patch: Record<string, unknown>) => {
+    await fetch("/api/preferences", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ preferences: patch }),
+    });
   }, []);
 
   const callDemo = useCallback(async (scenario: string) => {
@@ -185,6 +223,13 @@ export default function Dashboard() {
 
   return (
     <div style={{ maxWidth: 1400, margin: "0 auto", padding: "0 16px 80px" }}>
+
+      {/* Backend offline banner */}
+      {statusErr && (
+        <div style={{ background: "rgba(239,68,68,.12)", border: "1px solid #ef4444", borderRadius: 8, padding: "10px 16px", marginBottom: 16, fontSize: 12, color: "#fca5a5", display: "flex", alignItems: "center", gap: 8 }}>
+          <span>⚠</span> Backend unreachable — make sure <code style={{ background: "rgba(0,0,0,.3)", padding: "1px 5px", borderRadius: 4 }}>make dev</code> is running.
+        </div>
+      )}
 
       {/* Header */}
       <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "18px 0", borderBottom: "1px solid #1e2d4a", marginBottom: 20 }}>
@@ -222,7 +267,7 @@ export default function Dashboard() {
                 <span style={{ color: "#00ff88", fontWeight: 700 }}>${maxPerVideo.toFixed(2)}</span>
               </div>
               <input type="range" min={0} max={10} step={0.25} value={maxPerVideo}
-                onChange={e => setMaxPerVideo(parseFloat(e.target.value))}
+                onChange={e => { const v = parseFloat(e.target.value); setMaxPerVideo(v); pushPreferences({ max_per_video: v }); }}
                 style={{ width: "100%", accentColor: "#00ff88" }} />
             </div>
 
@@ -231,7 +276,7 @@ export default function Dashboard() {
               <p style={{ fontSize: 12, color: "#94a3b8", marginBottom: 8 }}>Token</p>
               <div style={{ display: "flex", gap: 6 }}>
                 {["USDT","XAUT","BTC"].map(t => (
-                  <button key={t} onClick={() => setToken(t)} style={{ flex: 1, padding: "5px 0", borderRadius: 6, border: `1px solid ${token===t?"#00ff88":"#1e2d4a"}`, background: token===t?"rgba(0,255,136,.1)":"transparent", color: token===t?"#00ff88":"#64748b", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>{t}</button>
+                  <button key={t} onClick={() => { setToken(t); pushPreferences({ preferred_token: t }); }} style={{ flex: 1, padding: "5px 0", borderRadius: 6, border: `1px solid ${token===t?"#00ff88":"#1e2d4a"}`, background: token===t?"rgba(0,255,136,.1)":"transparent", color: token===t?"#00ff88":"#64748b", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>{t}</button>
                 ))}
               </div>
             </div>
@@ -242,10 +287,42 @@ export default function Dashboard() {
               {([["watch","👁 Watch Time"],["chat","💬 Chat Emotion"],["milestones","🏆 Milestones"],["swarms","🌊 Swarms"]] as [keyof typeof triggers, string][]).map(([k, label]) => (
                 <div key={k} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                   <span style={{ fontSize: 13, color: "#e2e8f0" }}>{label}</span>
-                  <Toggle on={triggers[k]} onToggle={() => setTriggers(t => ({ ...t, [k]: !t[k] }))} />
+                  <Toggle on={triggers[k]} onToggle={() => { const next = !triggers[k]; setTriggers(t => ({ ...t, [k]: next })); pushPreferences({ enabled_triggers: Object.entries({ ...triggers, [k]: next }).filter(([,v]) => v).map(([key]) => ({ watch: "WATCH_TIME_UPDATE", chat: "CHAT_MESSAGE", milestones: "MILESTONE_REACHED", swarms: "SWARM_TRIGGERED" }[key])) }); }} />
                 </div>
               ))}
             </div>
+          </div>
+
+          {/* Bookmarklet */}
+          <div style={card}>
+            <h3 style={{ fontWeight: 600, fontSize: 13, color: "#e2e8f0", marginBottom: 8 }}>🔗 Real YouTube Signal</h3>
+            <p style={{ fontSize: 11, color: "#64748b", marginBottom: 10, lineHeight: 1.5 }}>
+              Watch a YouTube video, then click the bookmarklet to send your real watch% to TipMind.
+            </p>
+            <button
+              onClick={async () => {
+                const r = await fetch("/api/bookmarklet");
+                const d = await r.json();
+                // Create a temporary link and simulate drag-to-bookmarks by copying href
+                const a = document.createElement("a");
+                a.href = d.bookmarklet_href;
+                a.innerText = "TipMind";
+                const wrap = document.createElement("div");
+                wrap.style.cssText = "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#0f1629;border:1px solid #00ff88;padding:24px;border-radius:12px;z-index:9999;max-width:400px;font-family:monospace;font-size:12px;color:#e2e8f0";
+                wrap.innerHTML = `<p style="color:#00ff88;font-weight:700;margin-bottom:12px">Drag to bookmarks bar:</p>`;
+                wrap.appendChild(a);
+                a.style.cssText = "display:block;background:rgba(0,255,136,.1);border:1px solid #00ff88;border-radius:6px;padding:8px 12px;color:#00ff88;text-decoration:none;margin-bottom:12px;cursor:grab";
+                const close = document.createElement("button");
+                close.innerText = "✕ Close";
+                close.style.cssText = "background:none;border:1px solid #1e2d4a;color:#64748b;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px";
+                close.onclick = () => wrap.remove();
+                wrap.appendChild(close);
+                document.body.appendChild(wrap);
+              }}
+              style={{ width: "100%", padding: "7px 0", borderRadius: 7, border: "1px solid #00c9ff", background: "rgba(0,201,255,.08)", color: "#00c9ff", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+            >
+              Get YouTube Bookmarklet
+            </button>
           </div>
 
           {/* Top Creators */}
@@ -296,8 +373,9 @@ export default function Dashboard() {
             <div style={card}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
                 <h3 style={{ fontWeight: 600, fontSize: 13, color: "#e2e8f0" }}>⚡ Live Feed</h3>
-                <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: "#00ff88" }}>
-                  <span className="pulse-green" style={{ width: 6, height: 6, borderRadius: "50%", background: "#00ff88" }} /> LIVE
+                <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: wsStatus === "live" ? "#00ff88" : "#fbbf24" }}>
+                  <span className={wsStatus === "live" ? "pulse-green" : ""} style={{ width: 6, height: 6, borderRadius: "50%", background: wsStatus === "live" ? "#00ff88" : "#fbbf24" }} />
+                  {wsStatus === "live" ? "LIVE" : wsStatus === "reconnecting" ? "RECONNECTING…" : "CONNECTING…"}
                 </span>
               </div>
               <div style={{ maxHeight: 320, overflowY: "auto" }}>
@@ -366,7 +444,7 @@ export default function Dashboard() {
               {label}
             </button>
           ))}
-          <span style={{ marginLeft: "auto", color: "#475569", fontSize: 10 }}>ws://localhost:8000/ws/feed</span>
+          <span style={{ marginLeft: "auto", color: "#475569", fontSize: 10 }}>{(process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000") + "/ws/feed"}</span>
         </div>
       )}
     </div>

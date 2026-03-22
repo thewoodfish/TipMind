@@ -17,6 +17,13 @@ All logs prefixed [WATCH AGENT].
 from __future__ import annotations
 
 import json
+import re as _re
+
+def _parse_json(text: str) -> dict:
+    """Parse Claude's response, stripping markdown code fences if present."""
+    text = _re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=_re.MULTILINE)
+    text = _re.sub(r"```\s*$", "", text.strip(), flags=_re.MULTILINE)
+    return json.loads(text.strip())
 from datetime import date, datetime
 from typing import Any
 
@@ -41,10 +48,10 @@ from backend.data.models import (
 # ---------------------------------------------------------------------------
 
 class _Tier:
-    SKIP_BELOW   = 20.0   # watch% — don't even call Claude
-    SMALL_MIN    = 20.0
-    SMALL_MAX    = 50.0
-    SMALL_HINT   = 0.25   # hint passed to Claude
+    SKIP_BELOW   = 50.0   # watch% — don't even call Grok (saves credits)
+    SMALL_MIN    = 50.0
+    SMALL_MAX    = 70.0
+    SMALL_HINT   = 0.25   # hint passed to Grok
     MEDIUM_MIN   = 50.0
     MEDIUM_MAX   = 80.0
     MEDIUM_HINT  = 0.75
@@ -68,9 +75,10 @@ def _tip_hint(watch_pct: float) -> float | None:
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = (
-    "You are a fan tipping agent. Based on watch engagement, decide whether to tip "
-    "and how much. Be generous for high engagement, conservative for low. "
-    "Always return JSON."
+    "You are a fan tipping agent. Respond ONLY with a JSON object, no prose.\n"
+    "Format: {\"should_tip\": true/false, \"amount\": 0.00, \"reasoning\": \"...\", \"confidence\": 0.0}\n"
+    "Be generous for high engagement (>70%), conservative for low (<30%). "
+    "Avoid tipping the same creator repeatedly unless engagement is exceptional."
 )
 
 
@@ -144,15 +152,25 @@ class WatchTimeTipAgent:
         # ── Step 2: Claude decides ───────────────────────────────────
         async with self._db_factory() as db:
             already_tipped_today = await self._tipped_today(db, event.user_id)
+            recent_decisions = await self._recent_decisions(db, creator_id)
 
-        decision = await self._ask_claude(
-            watch_percentage=watch_pct,
-            video_duration=event.total_duration,
-            creator_name=creator_name,
-            user_max_per_video=user_max,
-            already_tipped_today=already_tipped_today,
-            hint=hint,
-        )
+        if config.effective_mock:
+            from backend.core.mock_claude import watch_decision
+            decision = watch_decision(
+                engagement_score=watch_pct,
+                creator_name=creator_name,
+                already_tipped_today=already_tipped_today,
+            )
+        else:
+            decision = await self._ask_claude(
+                watch_percentage=watch_pct,
+                video_duration=event.total_duration,
+                creator_name=creator_name,
+                user_max_per_video=user_max,
+                already_tipped_today=already_tipped_today,
+                hint=hint,
+                recent_decisions=recent_decisions,
+            )
 
         if not decision.get("should_tip"):
             logger.info(
@@ -168,10 +186,11 @@ class WatchTimeTipAgent:
         async with self._db_factory() as db:
             spent_today = await self._spent_today(db, event.user_id)
 
-        if spent_today + amount > user_max:
+        daily_max = float(payload.get("user_max_per_day", config.max_tip_per_day))
+        if spent_today + amount > daily_max:
             logger.info(
                 f"[WATCH AGENT] Daily budget exhausted "
-                f"(spent={spent_today:.2f}, max={user_max:.2f})"
+                f"(spent={spent_today:.2f}, daily_max={daily_max:.2f})"
             )
             return
 
@@ -247,28 +266,27 @@ class WatchTimeTipAgent:
         user_max_per_video: float,
         already_tipped_today: float,
         hint: float,
+        recent_decisions: list[dict] | None = None,
     ) -> dict:
         user_message = json.dumps({
             "watch_percentage": round(watch_percentage, 1),
             "video_duration": video_duration,
             "creator_name": creator_name,
             "user_max_per_video": user_max_per_video,
-            "already_tipped_today": already_tipped_today,
+            "already_tipped_today": round(already_tipped_today, 4),
             "suggested_tip_hint": hint,
+            "recent_decisions": recent_decisions or [],
         })
 
         logger.debug(f"[WATCH AGENT] Asking Claude — {user_message}")
 
-        async with self._client.messages.stream(
-            model="claude-sonnet-4-20250514",
-            max_tokens=256,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
-        ) as stream:
-            response = await stream.get_final_message()
-
-        text = next((b.text for b in response.content if b.type == "text"), "{}")
-        result = json.loads(text)
+        from backend.core.groq_client import chat as groq_chat
+        text = await groq_chat(system=SYSTEM_PROMPT, user=user_message, max_tokens=256)
+        try:
+            result = _parse_json(text)
+        except json.JSONDecodeError:
+            logger.warning(f"[WATCH AGENT] Claude returned non-JSON: {text[:80]!r} — skipping tip")
+            return {"should_tip": False, "amount": 0, "reasoning": "parse error", "confidence": 0}
 
         # Safety cap
         if result.get("amount", 0) > user_max_per_video:
@@ -297,3 +315,22 @@ class WatchTimeTipAgent:
 
     async def _spent_today(self, db: AsyncSession, user_id: str) -> float:
         return await self._tipped_today(db, user_id)
+
+    async def _recent_decisions(self, db: AsyncSession, creator_id: str) -> list[dict]:
+        """Last 3 agent decisions for this creator — gives Claude memory of past behaviour."""
+        stmt = (
+            select(AgentDecisionLogORM)
+            .where(AgentDecisionLogORM.creator_id == creator_id)
+            .order_by(AgentDecisionLogORM.id.desc())
+            .limit(3)
+        )
+        rows = await db.execute(stmt)
+        return [
+            {
+                "amount_usd": r.amount_usd,
+                "trigger": r.trigger,
+                "reasoning": r.reasoning[:120] if r.reasoning else "",
+                "confidence": r.confidence_score,
+            }
+            for r in rows.scalars()
+        ]

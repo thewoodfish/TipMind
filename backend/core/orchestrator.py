@@ -176,7 +176,7 @@ class Orchestrator:
                 today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
                 tips_today_row = await db.execute(
                     select(func.sum(TipTransactionORM.amount)).where(
-                        TipTransactionORM.created_at >= today_start,
+                        TipTransactionORM.timestamp >= today_start,
                         TipTransactionORM.status == "confirmed",
                     )
                 )
@@ -184,7 +184,7 @@ class Orchestrator:
 
                 tips_count_row = await db.execute(
                     select(func.count(TipTransactionORM.id)).where(
-                        TipTransactionORM.created_at >= today_start,
+                        TipTransactionORM.timestamp >= today_start,
                         TipTransactionORM.status == "confirmed",
                     )
                 )
@@ -250,9 +250,9 @@ class Orchestrator:
             "creator_id":      DEMO_CREATOR_ID,
             "creator_name":    "DemoCreator",
             "user_id":         "demo_fan_01",
-            "watch_percentage": 80.0,
-            "watch_duration":   480,
-            "total_duration":   600,
+            "percentage_watched": 80.0,
+            "watch_seconds":      480,
+            "total_duration":     600,
             "user_budget_remaining": self._preferences["max_per_video"],
         }
         await self.inject_event(EventType.WATCH_TIME_UPDATE, payload)

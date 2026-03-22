@@ -180,21 +180,15 @@ class SwarmAgent:
             "creator_id": creator_id,
         })
 
-        logger.debug(f"[SWARM AGENT] Asking Claude for announcement — {user_message}")
+        if config.effective_mock:
+            from backend.core.mock_claude import swarm_announcement
+            return swarm_announcement(swarm_id=creator_id)
 
-        async with self._client.messages.stream(
-            model="claude-opus-4-6",
-            max_tokens=128,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
-        ) as stream:
-            response = await stream.get_final_message()
+        logger.debug(f"[SWARM AGENT] Asking Groq for announcement — {user_message}")
 
-        announcement = next(
-            (b.text for b in response.content if b.type == "text"),
-            f"SWARM RELEASED: {participant_count} fans tipped ${total_amount:.2f} simultaneously!",
-        )
-        return announcement
+        from backend.core.groq_client import chat as groq_chat
+        announcement = await groq_chat(system=SYSTEM_PROMPT, user=user_message, max_tokens=128)
+        return announcement or f"SWARM RELEASED: {participant_count} fans tipped ${total_amount:.2f} simultaneously!"
 
     # ------------------------------------------------------------------
     # Demo helper

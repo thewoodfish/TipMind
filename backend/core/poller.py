@@ -31,7 +31,9 @@ from typing import Any
 import httpx
 from loguru import logger
 
+from backend.config import config
 from backend.core.event_bus import EventType, event_bus
+from backend.core.youtube_client import YouTubeDataClient
 
 # ---------------------------------------------------------------------------
 # Config
@@ -72,6 +74,14 @@ class YouTubePoller:
         self._task: asyncio.Task | None = None
         self._running = False
         self._channels: dict[str, str] = {}  # channel_id → creator_name
+        self._yt = YouTubeDataClient(config.youtube_api_key) if config.youtube_api_key else None
+        if self._yt:
+            logger.info("[POLLER] YouTube Data API key found — real engagement scoring enabled")
+        else:
+            logger.warning(
+                "[POLLER] No YOUTUBE_API_KEY set — using heuristic engagement scoring. "
+                "Set YOUTUBE_API_KEY in .env for real signal."
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -136,7 +146,9 @@ class YouTubePoller:
                 break
 
     async def _poll_all_channels(self) -> None:
-        """Poll every configured channel and process new videos."""
+        """Poll every configured channel and process new videos.
+        Seen-video cache is cleared each cycle so the demo feed stays alive."""
+        self._seen.clear()
         async with httpx.AsyncClient(timeout=RSS_TIMEOUT) as client:
             tasks = [
                 self._poll_channel(client, channel_id, name)
@@ -198,9 +210,34 @@ class YouTubePoller:
             f"[POLLER] Autonomous event injection: '{title[:60]}' by {creator_name}"
         )
 
-        # 1. Watch-time event — agent watches this video autonomously
-        watch_pct = round(random.uniform(75.0, 92.0), 1)
-        duration  = random.randint(480, 3600)   # 8 min – 1 hr
+        # 1. Fetch real engagement stats (or fall back to heuristic)
+        real_stats = None
+        if self._yt:
+            real_stats = await self._yt.get_video_stats(video_id)
+
+        if real_stats:
+            engagement_score = real_stats["engagement_score"]
+            duration         = real_stats["duration_seconds"] or random.randint(480, 3600)
+            watch_seconds    = int(duration * engagement_score / 100)
+            signal_source    = "youtube_data_api"
+            logger.info(
+                f"[POLLER] Real stats for '{title[:50]}': "
+                f"views={real_stats['view_count']:,} "
+                f"likes={real_stats['like_count']:,} "
+                f"engagement={engagement_score}%"
+            )
+        else:
+            # Heuristic fallback: use title keywords to bias the score
+            heuristic = _heuristic_engagement(title)
+            engagement_score = heuristic
+            duration         = random.randint(480, 3600)
+            watch_seconds    = int(duration * engagement_score / 100)
+            signal_source    = "heuristic"
+            logger.debug(
+                f"[POLLER] Heuristic engagement {engagement_score}% for '{title[:40]}'"
+            )
+
+        budget = config.max_tip_per_video
 
         await event_bus.publish(EventType.WATCH_TIME_UPDATE, {
             "video_id":              video_id,
@@ -208,14 +245,19 @@ class YouTubePoller:
             "creator_name":          creator_name,
             "title":                 title,
             "user_id":               "tipmind_agent",
-            "watch_seconds":         int(duration * watch_pct / 100),
+            "watch_seconds":         watch_seconds,
             "total_duration":        duration,
-            "percentage_watched":    watch_pct,
-            "user_budget_remaining": 5.0,
-            "source":                "autonomous_poller",
+            "percentage_watched":    engagement_score,
+            "user_budget_remaining": budget,
+            "source":                signal_source,
+            **({"view_count": real_stats["view_count"],
+                "like_count": real_stats["like_count"],
+                "days_since_publish": real_stats["days_since_publish"]}
+               if real_stats else {}),
         })
-        logger.debug(
-            f"[POLLER] Injected WATCH_TIME_UPDATE {watch_pct}% for '{title[:40]}'"
+        logger.info(
+            f"[POLLER] WATCH_TIME_UPDATE sent — "
+            f"engagement={engagement_score}% source={signal_source} '{title[:40]}'"
         )
 
         await asyncio.sleep(random.uniform(0.5, 1.5))
@@ -305,11 +347,46 @@ class YouTubePoller:
     def status(self) -> dict[str, Any]:
         """Return current poller status for /api/status endpoint."""
         return {
-            "running":        self.is_running,
-            "channels":       len(self._channels),
-            "videos_seen":    len(self._seen),
-            "poll_interval_s": POLL_INTERVAL,
+            "running":          self.is_running,
+            "channels":         len(self._channels),
+            "videos_seen":      len(self._seen),
+            "poll_interval_s":  POLL_INTERVAL,
+            "real_stats":       self._yt is not None,
         }
+
+
+# ---------------------------------------------------------------------------
+# Heuristic engagement scorer (no API key required)
+# ---------------------------------------------------------------------------
+
+def _heuristic_engagement(title: str) -> float:
+    """
+    Estimate engagement from video title keywords when YouTube API is unavailable.
+    Returns a score in 0–100 that maps to percentage_watched in the event payload.
+
+    Better than random: high-signal titles (tutorials, reviews, big events) score
+    higher than generic ones, which matches real-world engagement patterns.
+    """
+    title_lower = title.lower()
+
+    high_signal = [
+        "review", "tutorial", "how to", "vs", "vs.", "best",
+        "worst", "unboxing", "breakdown", "explained", "million",
+        "leaked", "exclusive", "first look", "hands on",
+    ]
+    medium_signal = [
+        "update", "new", "2024", "2025", "my", "i tried", "we tried",
+        "testing", "reacting", "reaction",
+    ]
+
+    high_hits   = sum(1 for kw in high_signal   if kw in title_lower)
+    medium_hits = sum(1 for kw in medium_signal if kw in title_lower)
+
+    base  = 45.0
+    score = base + (high_hits * 8.0) + (medium_hits * 4.0)
+    # Add small noise so not all videos look identical
+    score += random.uniform(-5.0, 5.0)
+    return round(min(max(score, 22.0), 88.0), 1)
 
 
 # ---------------------------------------------------------------------------

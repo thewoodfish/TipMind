@@ -27,6 +27,10 @@ from loguru import logger
 from backend.config import config
 from backend.core.event_bus import event_bus, EventType
 from backend.core.wallet import WalletFactory
+from datetime import date, datetime
+
+from sqlalchemy import func, select
+
 from backend.data.models import AgentDecisionLogORM, TipTransactionORM, ChatMessage
 
 
@@ -230,7 +234,15 @@ class EmotionChatAgent:
             f"msgs={len(recent)} rate={msg_rate:.2f}/s hype={hype_hits}"
         )
 
-        result = await self._ask_claude(payload_for_claude)
+        if config.effective_mock:
+            from backend.core.mock_claude import emotion_decision
+            excitement_hint = min(10, int(hype_hits * 1.5 + msg_rate * 2))
+            result = emotion_decision(
+                excitement_level=float(excitement_hint),
+                creator_name=creator_id,
+            )
+        else:
+            result = await self._ask_claude(payload_for_claude)
 
         excitement = int(result.get("excitement_level", 0))
         should_tip = result.get("should_tip", False)
@@ -276,16 +288,15 @@ class EmotionChatAgent:
     # ------------------------------------------------------------------
 
     async def _ask_claude(self, payload: dict) -> dict:
-        async with self._client.messages.stream(
-            model="claude-sonnet-4-20250514",
-            max_tokens=256,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": json.dumps(payload)}],
-        ) as stream:
-            response = await stream.get_final_message()
-
-        text = next((b.text for b in response.content if b.type == "text"), "{}")
-        return json.loads(text)
+        from backend.core.groq_client import chat as groq_chat
+        text = await groq_chat(system=SYSTEM_PROMPT, user=json.dumps(payload), max_tokens=256)
+        text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.MULTILINE)
+        text = re.sub(r"```\s*$", "", text.strip(), flags=re.MULTILINE)
+        try:
+            return json.loads(text.strip())
+        except json.JSONDecodeError:
+            logger.warning(f"[EMOTION AGENT] Claude non-JSON: {text[:80]!r}")
+            return {"excitement_level": 0, "should_tip": False, "reasoning": "parse error"}
 
     # ------------------------------------------------------------------
     # Tip execution + logging
@@ -302,6 +313,24 @@ class EmotionChatAgent:
         confidence: float,
     ) -> None:
         amount = min(amount, config.max_tip_per_video)
+
+        # Daily budget guard
+        daily_max = config.max_tip_per_day
+        async with self._db_factory() as db:
+            today_start = datetime.combine(date.today(), datetime.min.time())
+            row = await db.execute(
+                select(func.coalesce(func.sum(TipTransactionORM.amount), 0)).where(
+                    TipTransactionORM.timestamp >= today_start,
+                    TipTransactionORM.status == "confirmed",
+                )
+            )
+            spent_today = float(row.scalar() or 0)
+        if spent_today + amount > daily_max:
+            logger.info(
+                f"[EMOTION AGENT] Daily budget exhausted "
+                f"(spent={spent_today:.2f}, daily_max={daily_max:.2f})"
+            )
+            return
 
         try:
             tx = await self._wallet.send_tip(
@@ -380,16 +409,8 @@ Return JSON only:
         )
         logger.info(f"[EMOTION AGENT] Analyzing video: {video_metadata.get('title', 'unknown')}")
 
-        async with self._client.messages.stream(
-            model="claude-opus-4-6",
-            max_tokens=512,
-            thinking={"type": "adaptive"},
-            system=self.SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
-        ) as stream:
-            response = await stream.get_final_message()
-
-        text = next((b.text for b in response.content if b.type == "text"), "{}")
+        from backend.core.groq_client import chat as groq_chat
+        text = await groq_chat(system=self.SYSTEM_PROMPT, user=user_message, max_tokens=512)
         result = json.loads(text)
         logger.info(f"[EMOTION AGENT] Score: {result.get('score', 0)}")
         return result

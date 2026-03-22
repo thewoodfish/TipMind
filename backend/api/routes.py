@@ -57,10 +57,17 @@ class WatchEventRequest(BaseModel):
     creator_id: str
     creator_name: str = ""
     user_id: str = "user_001"
-    watch_percentage: float
+    watch_percentage: float        # from bookmarklet / caller
     watch_duration: int = 0
     total_duration: int = 0
     user_budget_remaining: float = 5.0
+
+    def to_event_payload(self) -> dict:
+        """Map to the field names WatchTimeTipAgent expects."""
+        d = self.model_dump()
+        d["percentage_watched"] = d.pop("watch_percentage")
+        d["watch_seconds"] = d.pop("watch_duration")
+        return d
 
 
 class ChatMessageRequest(BaseModel):
@@ -171,7 +178,7 @@ async def list_transactions(
     """Recent tip transactions with pagination."""
     stmt = (
         select(TipTransactionORM)
-        .order_by(desc(TipTransactionORM.created_at))
+        .order_by(desc(TipTransactionORM.timestamp))
         .limit(limit)
         .offset(offset)
     )
@@ -196,7 +203,7 @@ async def list_transactions(
                 "creator_id":   t.creator_id,
                 "trigger_type": t.trigger_type,
                 "status":       t.status,
-                "created_at":   t.created_at.isoformat() if t.created_at else None,
+                "created_at":   t.timestamp.isoformat() if t.timestamp else None,
             }
             for t in tips
         ],
@@ -298,7 +305,7 @@ async def get_metrics(db: AsyncSession = Depends(get_db)):
     # Total tipped today
     today_row = await db.execute(
         select(func.sum(TipTransactionORM.amount)).where(
-            TipTransactionORM.created_at >= today_start,
+            TipTransactionORM.timestamp >= today_start,
             TipTransactionORM.status == "confirmed",
         )
     )
@@ -306,7 +313,7 @@ async def get_metrics(db: AsyncSession = Depends(get_db)):
 
     today_count_row = await db.execute(
         select(func.count(TipTransactionORM.id)).where(
-            TipTransactionORM.created_at >= today_start,
+            TipTransactionORM.timestamp >= today_start,
             TipTransactionORM.status == "confirmed",
         )
     )
@@ -315,7 +322,7 @@ async def get_metrics(db: AsyncSession = Depends(get_db)):
     # Total tipped this week
     week_row = await db.execute(
         select(func.sum(TipTransactionORM.amount)).where(
-            TipTransactionORM.created_at >= week_start,
+            TipTransactionORM.timestamp >= week_start,
             TipTransactionORM.status == "confirmed",
         )
     )
@@ -323,7 +330,7 @@ async def get_metrics(db: AsyncSession = Depends(get_db)):
 
     week_count_row = await db.execute(
         select(func.count(TipTransactionORM.id)).where(
-            TipTransactionORM.created_at >= week_start,
+            TipTransactionORM.timestamp >= week_start,
             TipTransactionORM.status == "confirmed",
         )
     )
@@ -390,8 +397,68 @@ async def inject_event(body: InjectEventRequest):
 @router.post("/events/watch")
 async def inject_watch_event(body: WatchEventRequest):
     """Shorthand: inject a WATCH_TIME_UPDATE event."""
-    await orchestrator.inject_event(EventType.WATCH_TIME_UPDATE, body.model_dump())
+    await orchestrator.inject_event(EventType.WATCH_TIME_UPDATE, body.to_event_payload())
     return {"ok": True}
+
+
+@router.get("/bookmarklet")
+async def get_bookmarklet():
+    """
+    Returns a JavaScript bookmarklet that captures real YouTube watch data
+    and posts it to TipMind. Drag the returned `bookmarklet_href` to your
+    bookmarks bar, then click it while watching any YouTube video.
+    """
+    js = (
+        "javascript:(function(){"
+        "var v=document.querySelector('video');"
+        "if(!v){alert('No video found on this page');return;}"
+        "var pct=Math.round(v.currentTime/v.duration*1000)/10;"
+        "var vid=window.location.href.match(/v=([^&]+)/);"
+        "var vidId=vid?vid[1]:'unknown';"
+        "var chan=document.querySelector('ytd-channel-name a,#owner-name a');"
+        "var chanName=chan?chan.innerText.trim():'Unknown Creator';"
+        "var chanId=document.querySelector('ytd-video-owner-renderer a')||chan;"
+        "var chanHref=chanId?chanId.href:'';"
+        "var creatorId=chanHref.match(/\\/channel\\/([^/?]+)/)?chanHref.match(/\\/channel\\/([^/?]+)/)[1]:chanName;"
+        "fetch('http://localhost:8000/api/watch',{"
+        "method:'POST',"
+        "headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({"
+        "video_id:vidId,"
+        "creator_id:creatorId,"
+        "creator_name:chanName,"
+        "user_id:'bookmarklet_user',"
+        "watch_percentage:pct,"
+        "watch_duration:Math.round(v.currentTime),"
+        "total_duration:Math.round(v.duration),"
+        "user_budget_remaining:5.0"
+        "})"
+        "}).then(r=>r.json()).then(d=>{"
+        "var msg=d.ok?'TipMind signal sent! '+pct+'% watched':'Error: '+JSON.stringify(d);"
+        "var el=document.createElement('div');"
+        "el.style.cssText='position:fixed;top:20px;right:20px;background:#0f1629;color:#00ff88;border:1px solid #00ff88;padding:12px 20px;border-radius:8px;font-family:monospace;font-size:13px;z-index:9999;box-shadow:0 0 20px rgba(0,255,136,.3)';"
+        "el.innerText=msg;"
+        "document.body.appendChild(el);"
+        "setTimeout(()=>el.remove(),3000);"
+        "}).catch(e=>alert('TipMind not running: '+e));"
+        "})()"
+    )
+    return {
+        "bookmarklet_href": js,
+        "instructions": (
+            "1. Copy the bookmarklet_href value\n"
+            "2. Create a new bookmark in your browser and paste it as the URL\n"
+            "3. Navigate to any YouTube video\n"
+            "4. Click the bookmark — TipMind will receive your real watch percentage"
+        ),
+    }
+
+
+@router.post("/watch")
+async def inject_watch_from_bookmarklet(body: WatchEventRequest):
+    """Receives real watch data from the browser bookmarklet (CORS-friendly alias)."""
+    await orchestrator.inject_event(EventType.WATCH_TIME_UPDATE, body.to_event_payload())
+    return {"ok": True, "message": f"Signal received: {body.watch_percentage}% watched"}
 
 
 @router.post("/events/chat")

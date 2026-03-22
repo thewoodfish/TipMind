@@ -16,10 +16,13 @@ All logs prefixed [MILESTONE AGENT].
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import anthropic
 from loguru import logger
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import config
 from backend.core.event_bus import event_bus, EventType
@@ -108,15 +111,27 @@ class MilestoneTipAgent:
 
         base_tip = BASE_TIPS.get(event.milestone_type, 0.50)
 
-        # ── Ask Claude ────────────────────────────────────────────────
-        decision = await self._ask_claude(
-            milestone_type=event.milestone_type.value,
-            milestone_value=event.value,
-            creator_name=creator_name,
-            creator_history=creator_history,
-            user_budget_remaining=budget_remaining,
-            base_tip_hint=base_tip,
-        )
+        # ── Ask Claude (or mock) ──────────────────────────────────────
+        async with self._db_factory() as db:
+            recent_decisions = await self._recent_decisions(db, event.creator_id)
+
+        if config.effective_mock:
+            from backend.core.mock_claude import milestone_decision
+            decision = milestone_decision(
+                milestone_type=event.milestone_type.value,
+                creator_name=creator_name,
+                base_tip_hint=base_tip,
+            )
+        else:
+            decision = await self._ask_claude(
+                milestone_type=event.milestone_type.value,
+                milestone_value=event.value,
+                creator_name=creator_name,
+                creator_history=creator_history,
+                user_budget_remaining=budget_remaining,
+                base_tip_hint=base_tip,
+                recent_decisions=recent_decisions,
+            )
 
         tip_amount   = min(float(decision.get("tip_amount", base_tip)), config.max_tip_per_video)
         message      = decision.get("message", "")
@@ -210,6 +225,7 @@ class MilestoneTipAgent:
         creator_history: list[str],
         user_budget_remaining: float,
         base_tip_hint: float,
+        recent_decisions: list[dict] | None = None,
     ) -> dict:
         user_message = json.dumps({
             "milestone_type": milestone_type,
@@ -219,20 +235,38 @@ class MilestoneTipAgent:
             "user_budget_remaining": user_budget_remaining,
             "base_tip_hint": base_tip_hint,
             "max_tip": config.max_tip_per_video,
+            "recent_decisions": recent_decisions or [],
         })
 
-        logger.debug(f"[MILESTONE AGENT] Asking Claude — {user_message}")
+        logger.debug(f"[MILESTONE AGENT] Asking Groq — {user_message}")
 
-        async with self._client.messages.stream(
-            model="claude-sonnet-4-20250514",
-            max_tokens=256,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
-        ) as stream:
-            response = await stream.get_final_message()
+        from backend.core.groq_client import chat as groq_chat
+        text = await groq_chat(system=SYSTEM_PROMPT, user=user_message, max_tokens=256)
+        text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.MULTILINE)
+        text = re.sub(r"```\s*$", "", text.strip(), flags=re.MULTILINE)
+        try:
+            return json.loads(text.strip())
+        except json.JSONDecodeError:
+            logger.warning(f"[MILESTONE AGENT] Claude non-JSON: {text[:80]!r}")
+            return {"tip_amount": base_tip_hint if base_tip_hint else 0.5, "trigger_swarm": False, "reasoning": "parse error", "message": ""}
 
-        text = next((b.text for b in response.content if b.type == "text"), "{}")
-        return json.loads(text)
+    async def _recent_decisions(self, db: AsyncSession, creator_id: str) -> list[dict]:
+        """Last 3 decisions for this creator to give Claude historical context."""
+        stmt = (
+            select(AgentDecisionLogORM)
+            .where(AgentDecisionLogORM.creator_id == creator_id)
+            .order_by(AgentDecisionLogORM.id.desc())
+            .limit(3)
+        )
+        rows = await db.execute(stmt)
+        return [
+            {
+                "amount_usd": r.amount_usd,
+                "trigger": r.trigger,
+                "reasoning": r.reasoning[:120] if r.reasoning else "",
+            }
+            for r in rows.scalars()
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -271,16 +305,8 @@ Respond ONLY with valid JSON."""
         )
         logger.info(f"[MILESTONE AGENT] Evaluating {len(candidates)} candidates (inline)")
 
-        async with self._client.messages.stream(
-            model="claude-opus-4-6",
-            max_tokens=512,
-            thinking={"type": "adaptive"},
-            system=self.SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
-        ) as stream:
-            response = await stream.get_final_message()
-
-        text = next((b.text for b in response.content if b.type == "text"), "{}")
+        from backend.core.groq_client import chat as groq_chat
+        text = await groq_chat(system=self.SYSTEM_PROMPT, user=user_message, max_tokens=512)
         result = json.loads(text)
         logger.info(f"[MILESTONE AGENT] triggered={result.get('milestone_triggered')} bonus={result.get('total_bonus', 0)}")
         return result

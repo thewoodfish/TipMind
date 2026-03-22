@@ -23,7 +23,13 @@
  *   Ethereum mainnet 0xdAC17F958D2ee523a2206206994597C13D831ec7  (6 decimals)
  */
 
-import 'dotenv/config';
+import dotenv from 'dotenv';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = dirname(__filename);
+// Load .env from project root (parent of wdk-service/)
+dotenv.config({ path: resolve(__dirname, '../.env') });
 import express from 'express';
 import { ethers } from 'ethers';
 import WDK from '@tetherto/wdk';
@@ -42,8 +48,30 @@ const SEED       = process.env.WDK_SEED_PHRASE || '';
 const USDT_CONTRACTS = {
   polygon:  '0xc2132D05D31c914a87C6611C10748AEb04B58e8F',
   ethereum: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
+  // Amoy testnet has no official Tether USDT — we use native MATIC transfers instead.
+  // Tips are labelled "MATIC" but are genuine on-chain transactions on amoy.polygonscan.com.
+  amoy: null,
 };
 const USDT_DECIMALS = 6;
+
+// Chains where we send native token (MATIC/ETH) instead of ERC-20 USDT
+const NATIVE_TRANSFER_CHAINS = new Set(['amoy']);
+
+// On testnet, scale tip amounts down so the demo wallet doesn't run dry.
+// $1.00 tip → 0.01 MATIC on Amoy. Transactions are real; amounts are symbolic.
+const TESTNET_AMOUNT_SCALE = 0.01;
+
+const CHAIN_EXPLORERS = {
+  polygon:  'https://polygonscan.com/tx',
+  ethereum: 'https://etherscan.io/tx',
+  amoy:     'https://amoy.polygonscan.com/tx',
+};
+
+const CHAIN_RPC_DEFAULTS = {
+  polygon:  'https://polygon-rpc.com',
+  ethereum: 'https://eth.llamarpc.com',
+  amoy:     'https://rpc-amoy.polygon.technology',
+};
 
 // Minimal ERC-20 ABI — only what we need
 const ERC20_ABI = [
@@ -56,6 +84,7 @@ const ERC20_ABI = [
 // ─────────────────────────────────────────────────────────────────────────────
 
 let account;         // WDK account object
+let signer;          // ethers.js Wallet signer (used for native token transfers on testnet)
 let provider;        // ethers.js JsonRpcProvider for read operations
 let usdtContract;    // ethers.js Contract for USDT balance reads
 
@@ -66,22 +95,40 @@ async function initWDK() {
     );
   }
 
-  console.log(`[WDK] Initialising wallet on ${CHAIN} via ${RPC_URL}...`);
+  const rpc = RPC_URL || CHAIN_RPC_DEFAULTS[CHAIN] || CHAIN_RPC_DEFAULTS.polygon;
+  console.log(`[WDK] Initialising wallet on ${CHAIN} via ${rpc}...`);
 
-  const wdk = new WDK(SEED).registerWallet(CHAIN, WalletManagerEvm, {
-    rpcUrl: RPC_URL,
+  // WDK only recognises 'polygon' and 'ethereum' as chain names.
+  // For Amoy testnet we register as 'polygon' but point the RPC at Amoy —
+  // same EVM address derivation, transactions land on the correct network.
+  const wdkChainKey = CHAIN === 'amoy' ? 'polygon' : CHAIN;
+
+  const wdk = new WDK(SEED).registerWallet(wdkChainKey, WalletManagerEvm, {
+    rpcUrl: rpc,
   });
 
-  account = await wdk.getAccount(CHAIN, 0);
+  account  = await wdk.getAccount(wdkChainKey, 0);
+  provider = new ethers.JsonRpcProvider(rpc);
 
-  provider     = new ethers.JsonRpcProvider(RPC_URL);
-  usdtContract = new ethers.Contract(
-    USDT_CONTRACTS[CHAIN] || USDT_CONTRACTS.polygon,
-    ERC20_ABI,
-    provider
+  // Derive ethers.js signer from same BIP-39 seed — used for testnet native sends
+  // when WDK account.sendTransaction() doesn't support the custom chain.
+  const hdNode = ethers.HDNodeWallet.fromMnemonic(
+    ethers.Mnemonic.fromPhrase(SEED),
+    "m/44'/60'/0'/0/0"
   );
+  signer = hdNode.connect(provider);
+
+  // Only create USDT contract when the chain has one
+  const usdtAddr = USDT_CONTRACTS[CHAIN];
+  if (usdtAddr) {
+    usdtContract = new ethers.Contract(usdtAddr, ERC20_ABI, provider);
+  } else {
+    usdtContract = null;
+    console.log(`[WDK] ${CHAIN} has no USDT contract — native token transfers will be used.`);
+  }
 
   console.log(`[WDK] Ready. Address: ${account.address}`);
+  console.log(`[WDK] Explorer: ${CHAIN_EXPLORERS[CHAIN] || 'unknown'}`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -131,10 +178,12 @@ app.use((req, res, next) => {
 // ── GET /health ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.json({
-    status: account ? 'ready' : 'initialising',
-    address: account?.address ?? null,
-    chain: CHAIN,
-    rpc: RPC_URL,
+    status:       account ? 'ready' : 'initialising',
+    address:      account?.address ?? null,
+    chain:        CHAIN,
+    rpc:          RPC_URL || CHAIN_RPC_DEFAULTS[CHAIN],
+    native_mode:  NATIVE_TRANSFER_CHAINS.has(CHAIN),
+    explorer:     CHAIN_EXPLORERS[CHAIN] ?? null,
   });
 });
 
@@ -146,15 +195,21 @@ app.get('/address', (_req, res) => {
 // ── GET /balance ─────────────────────────────────────────────────────────────
 app.get('/balance', async (req, res) => {
   try {
-    const token = (req.query.token || 'USDT').toUpperCase();
-    let balance;
+    let balance, token;
 
-    if (token === 'USDT') {
-      balance = await getUsdtBalance(account.address);
-    } else {
-      // Native token (MATIC / ETH)
+    if (NATIVE_TRANSFER_CHAINS.has(CHAIN)) {
+      // Testnet: report native MATIC balance
       const raw = await provider.getBalance(account.address);
       balance = parseFloat(ethers.formatEther(raw));
+      token = 'MATIC';
+    } else {
+      token = (req.query.token || 'USDT').toUpperCase();
+      if (token === 'USDT' && usdtContract) {
+        balance = await getUsdtBalance(account.address);
+      } else {
+        const raw = await provider.getBalance(account.address);
+        balance = parseFloat(ethers.formatEther(raw));
+      }
     }
 
     res.json({ balance, token, address: account.address });
@@ -176,29 +231,56 @@ app.post('/send', async (req, res) => {
   }
 
   try {
-    const usdtAddr = USDT_CONTRACTS[CHAIN];
-    console.log(`[WDK] Sending ${amount} ${token} → ${to}`);
+    let tx, sentToken;
 
-    // Build the ERC-20 transfer transaction
-    const tx = {
-      to:    usdtAddr,
-      data:  encodeUsdtTransfer(to, amount),
-      value: '0',
-    };
+    let txHash, txFee;
 
-    // WDK signs and broadcasts the transaction
-    const { hash: txHash, fee: txFee } = await account.sendTransaction(tx);
+    if (NATIVE_TRANSFER_CHAINS.has(CHAIN)) {
+      // Testnet: send native MATIC via ethers.js signer (WDK-derived key, same address)
+      // Amounts are scaled down (TESTNET_AMOUNT_SCALE) so the demo wallet doesn't run dry.
+      const scaledAmount = amount * TESTNET_AMOUNT_SCALE;
+      const valueWei = ethers.parseEther(scaledAmount.toFixed(8));
+      sentToken = 'MATIC';
+      console.log(`[WDK] Sending ${scaledAmount.toFixed(8)} MATIC (=$${amount} scaled) on Amoy → ${to}`);
+      // Fetch fresh nonce and fee data — prevents replacement/underpriced errors
+      const [nonce, feeData] = await Promise.all([
+        provider.getTransactionCount(signer.address, 'pending'),
+        provider.getFeeData(),
+      ]);
+      const gasPrice = feeData.gasPrice
+        ? (feeData.gasPrice * 150n) / 100n   // 1.5× current gas price
+        : ethers.parseUnits('50', 'gwei');
+      const txResponse = await signer.sendTransaction({ to, value: valueWei, gasPrice, nonce });
+      txHash = txResponse.hash;
+      txFee  = txResponse.gasPrice?.toString() ?? '0';
+    } else {
+      // Mainnet: ERC-20 USDT via WDK account.sendTransaction()
+      const usdtAddr = USDT_CONTRACTS[CHAIN];
+      sentToken = 'USDT';
+      console.log(`[WDK] Sending ${amount} USDT → ${to}`);
+      const result = await account.sendTransaction({
+        to:    usdtAddr,
+        data:  encodeUsdtTransfer(to, amount),
+        value: '0',
+      });
+      txHash = result.hash;
+      txFee  = result.fee?.toString() ?? '0';
+    }
+
+    const explorerUrl = `${CHAIN_EXPLORERS[CHAIN] || ''}/${txHash}`;
 
     console.log(`[WDK] Broadcast ✓ tx_hash=${txHash}  fee=${txFee}`);
+    console.log(`[WDK] Explorer: ${explorerUrl}`);
 
     res.json({
-      tx_hash: txHash,
-      fee:     txFee?.toString() ?? '0',
-      from:    account.address,
+      tx_hash:      txHash,
+      fee:          txFee,
+      from:         account.address,
       to,
       amount,
-      token,
-      status:  'confirmed',
+      token:        sentToken,
+      status:       'confirmed',
+      explorer_url: explorerUrl,
     });
   } catch (err) {
     console.error('[WDK] /send error:', err.message);
